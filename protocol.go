@@ -3,11 +3,27 @@ package shclient
 import "encoding/binary"
 
 // Коды команд протокола (PD).
+//
+// Значения сверены с эталонными реализациями клиента на PHP и Python.
 const (
-	PDRequestAllDevices   uint8 = 4  // запрос всех устройств
-	PDSetStatusToServer   uint8 = 5  // установка статуса на сервер
-	PDSetStatusFromServer uint8 = 7  // получение статуса от сервера
-	PDPingModule          uint8 = 15 // пинг модуля с состояниями
+	PDStartPacket uint8 = 1 // стартовый пакет; в эталонах объявлен, но не используется
+
+	// PDSetStatusToServer — установка состояния элемента (клиент → сервер).
+	PDSetStatusToServer uint8 = 5
+
+	// PDSetStatusFromServer — состояние одного элемента (сервер → клиент).
+	PDSetStatusFromServer uint8 = 7
+
+	// PDRequestAllDevices — запрос состояний. При id = 0 отвечают все
+	// устройства, при id = <модуль> этот модуль отвечает первым.
+	// Этим же пакетом эталонный Python-клиент поддерживает соединение живым.
+	PDRequestAllDevices uint8 = 14
+
+	// PDPingModule — ответ модуля со всеми состояниями своих элементов
+	// (сервер → клиент). Клиент такие пакеты не отправляет.
+	PDPingModule uint8 = 15
+
+	PDSynchroTime uint8 = 30 // синхронизация времени; в эталонах не используется
 )
 
 // Размеры элементов протокола.
