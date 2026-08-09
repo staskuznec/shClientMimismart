@@ -1,0 +1,22 @@
+# Бинарники и артефакты сборки
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+/dist/
+/bin/
+
+# Покрытие
+coverage.txt
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# ОС
+.DS_Store
+Thumbs.db
