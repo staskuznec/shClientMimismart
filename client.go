@@ -178,6 +178,33 @@ func (c *Client) Send(ctx context.Context, values ...Value) error {
 	return nil
 }
 
+// RequestAll просит сервер отдать состояния всех элементов.
+//
+// Ответ приходит пачками пакетов [PDPingModule]; эта версия клиента их не
+// разбирает, поэтому вычитать их нужно самостоятельно — через [Client.Drain]
+// или автоматическим вычитыванием после [Client.Send].
+//
+// Пакет уходит с нулевым идентификатором клиента, а не с полученным при
+// рукопожатии: так делают эталонные реализации.
+func (c *Client) RequestAll(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn == nil {
+		return ErrNotConnected
+	}
+	conn := c.conn
+
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	defer stop()
+
+	if err := c.write(conn, packPacket(0, 0, 0, PDRequestAllDevices, nil)); err != nil {
+		return fmt.Errorf("shclient: запрос состояний: %w", err)
+	}
+	c.opts.logger.DebugContext(ctx, "shclient: запрошены состояния всех элементов")
+	return nil
+}
+
 // Drain вычитывает и отбрасывает всё, что сервер прислал в течение d.
 // Нужен, если автоматическое вычитывание отключено через [WithAutoDrain].
 func (c *Client) Drain(ctx context.Context, d time.Duration) error {
@@ -244,11 +271,12 @@ func (c *Client) handshake(conn net.Conn) (uint16, error) {
 			}
 			clientID := initClientDefValue - uint16(crc[crcByteSize-1])
 
-			// Остаток пакета — сама логика, она нам не нужна,
-			// но её надо вычитать, чтобы не сбить границы кадров.
+			// Остаток пакета — сама логика. Вычитать её надо в любом случае,
+			// иначе разъедутся границы кадров; отдаём ли мы её наружу,
+			// решает [WithLogicSink].
 			if rest := length - replyTagSize - crcByteSize; rest > 0 {
-				if err := c.discard(conn, int64(rest)); err != nil {
-					return 0, fmt.Errorf("shclient: пропуск XML-логики: %w", err)
+				if err := c.readLogic(conn, int64(rest)); err != nil {
+					return 0, err
 				}
 			}
 			return clientID, nil
@@ -300,6 +328,47 @@ func (c *Client) write(conn net.Conn, data []byte) error {
 	}
 	_, err := conn.Write(data)
 	return err
+}
+
+// readLogic вычитывает n байт logic.xml: отдаёт их приёмнику, если он задан
+// через [WithLogicSink], иначе просто отбрасывает.
+func (c *Client) readLogic(conn net.Conn, n int64) error {
+	if c.opts.logicSink == nil {
+		if err := c.discard(conn, n); err != nil {
+			return fmt.Errorf("shclient: пропуск XML-логики: %w", err)
+		}
+		return nil
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(c.opts.readTimeout)); err != nil {
+		return err
+	}
+	sink := &logicSink{w: c.opts.logicSink}
+	if _, err := io.CopyN(sink, conn, n); err != nil {
+		return fmt.Errorf("shclient: чтение XML-логики: %w", err)
+	}
+	if sink.err != nil {
+		return fmt.Errorf("shclient: запись XML-логики: %w", sink.err)
+	}
+	return nil
+}
+
+// logicSink пишет в приёмник пользователя и запоминает первую его ошибку,
+// но сам ошибку наружу не отдаёт: поток из сокета нужно дочитать до конца
+// в любом случае, иначе хвост логики останется в сокете и следующий кадр
+// разъедется.
+type logicSink struct {
+	w   io.Writer
+	err error
+}
+
+func (s *logicSink) Write(p []byte) (int, error) {
+	if s.err == nil {
+		if _, err := s.w.Write(p); err != nil {
+			s.err = err
+		}
+	}
+	return len(p), nil
 }
 
 // discard вычитывает и отбрасывает n байт без лишних аллокаций.

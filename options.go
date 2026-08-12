@@ -2,6 +2,7 @@ package shclient
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"time"
 )
@@ -35,6 +36,7 @@ type options struct {
 	udpRetrans   bool
 	macID        string
 	logger       *slog.Logger
+	logicSink    io.Writer
 }
 
 func defaultOptions() options {
@@ -101,6 +103,21 @@ func WithUDPRetranslate(v bool) Option {
 // на crypto/rand.
 func WithMacID(mac string) Option {
 	return func(o *options) { o.macID = mac }
+}
+
+// WithLogicSink задаёт приёмник для logic.xml — описания областей и элементов,
+// которое сервер присылает в ответе на рукопожатие: адреса, имена и типы.
+// По умолчанию логика отбрасывается, потому что держать её в памяти нужно
+// далеко не всем.
+//
+// Байты пишутся как есть, без разбора XML: что с ними делать, решает
+// вызывающий код. Запись идёт внутри [Client.Connect], потоком, поэтому
+// приёмником может быть файл — весь документ в памяти собирать не обязательно.
+//
+// Если приёмник вернёт ошибку, [Client.Connect] завершится ошибкой: молча
+// потерять данные, которые у нас попросили, хуже, чем не подключиться.
+func WithLogicSink(w io.Writer) Option {
+	return func(o *options) { o.logicSink = w }
 }
 
 // WithLogger включает журналирование. По умолчанию логи никуда не пишутся —

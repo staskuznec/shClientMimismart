@@ -6,6 +6,7 @@ import (
 	"crypto/aes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -21,6 +22,7 @@ type fakeServer struct {
 	ln       net.Listener
 	serverB  byte   // байт, из которого клиент вычисляет client id
 	reply    string // тег ответа на XML-запрос
+	logic    []byte // тело logic.xml в ответе shcxml
 	junkTags []string
 
 	mu       sync.Mutex
@@ -31,11 +33,19 @@ type fakeServer struct {
 
 func newFakeServer(t *testing.T, serverB byte, reply string, junkTags ...string) *fakeServer {
 	t.Helper()
+	return newFakeServerLogic(t, serverB, reply, []byte("<logic/>"), junkTags...)
+}
+
+func newFakeServerLogic(t *testing.T, serverB byte, reply string, logic []byte, junkTags ...string) *fakeServer {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &fakeServer{t: t, ln: ln, serverB: serverB, reply: reply, junkTags: junkTags, done: make(chan struct{})}
+	s := &fakeServer{
+		t: t, ln: ln, serverB: serverB, reply: reply,
+		logic: logic, junkTags: junkTags, done: make(chan struct{}),
+	}
 	go s.serve()
 	t.Cleanup(func() { _ = ln.Close() })
 	return s
@@ -112,7 +122,7 @@ func (s *fakeServer) serve() {
 		}
 		return
 	case tagSHCXML:
-		if _, err := conn.Write(shcxmlFrame(s.serverB, []byte("<logic/>"))); err != nil {
+		if _, err := conn.Write(shcxmlFrame(s.serverB, s.logic)); err != nil {
 			return
 		}
 	default:
@@ -226,6 +236,86 @@ func TestXMLRequestMatchesReference(t *testing.T) {
 	}
 }
 
+// bigLogic собирает правдоподобный logic.xml, заведомо больше одного чтения
+// из сокета: так проверяется, что логика вычитывается потоком целиком.
+func bigLogic(items int) []byte {
+	var b bytes.Buffer
+	b.WriteString("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<shc>\n")
+	for i := 0; i < items; i++ {
+		fmt.Fprintf(&b, "<item addr=\"%d:1\" cfgid=\"%d\" name=\"Комната %d\" type=\"lamp\"/>\n", 700+i, i, i)
+	}
+	b.WriteString("</shc>\n")
+	return b.Bytes()
+}
+
+// TestConnectDeliversLogic проверяет, что logic.xml доезжает до приёмника
+// байт в байт.
+func TestConnectDeliversLogic(t *testing.T) {
+	logic := bigLogic(2000)
+	s := newFakeServerLogic(t, 0x10, tagSHCXML, logic)
+
+	var sink bytes.Buffer
+	c := testClient(t, s.addr(), WithLogicSink(&sink))
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if got := sink.Bytes(); !bytes.Equal(got, logic) {
+		t.Errorf("в приёмник пришло %d байт, ожидалось %d", len(got), len(logic))
+	}
+}
+
+// TestConnectWithoutLogicSinkKeepsFrames проверяет, что без приёмника большая
+// логика по-прежнему отбрасывается целиком и не сбивает границы кадров:
+// следующий же пакет должен уехать на провод неискажённым.
+func TestConnectWithoutLogicSinkKeepsFrames(t *testing.T) {
+	const serverByte = 0x10
+	s := newFakeServerLogic(t, serverByte, tagSHCXML, bigLogic(2000))
+	c := testClient(t, s.addr())
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := c.Send(context.Background(), Byte(773, 1, 1)); err != nil {
+		t.Fatal(err)
+	}
+
+	want := refPackReceiveData(initClientDefValue-uint16(serverByte), 773, 1, PDSetStatusToServer, 1, []byte{1})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(s.Received()) >= len(want) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := s.Received(); !bytes.Equal(got, want) {
+		t.Errorf("после пропуска логики на провод ушло:\n получено %#v\n ожидалось %#v", got, want)
+	}
+}
+
+var errSinkBroken = errors.New("приёмник сломан")
+
+type brokenWriter struct{}
+
+func (brokenWriter) Write([]byte) (int, error) { return 0, errSinkBroken }
+
+// TestConnectFailsOnBrokenLogicSink: молча потерять логику, которую у нас
+// попросили, хуже, чем не подключиться.
+func TestConnectFailsOnBrokenLogicSink(t *testing.T) {
+	s := newFakeServerLogic(t, 0x10, tagSHCXML, bigLogic(100))
+	c := testClient(t, s.addr(), WithLogicSink(brokenWriter{}))
+
+	err := c.Connect(context.Background())
+	if !errors.Is(err, errSinkBroken) {
+		t.Fatalf("получено %v, ожидалась ошибка приёмника", err)
+	}
+	if c.Connected() {
+		t.Error("клиент считает себя подключённым после ошибки приёмника")
+	}
+}
+
 func TestConnectInvalidKeyRejectedByServer(t *testing.T) {
 	s := newFakeServer(t, 0, tagPKFail)
 	c := testClient(t, s.addr())
@@ -305,6 +395,44 @@ func TestSendWritesExactBytes(t *testing.T) {
 	}
 	if got := s.Received(); !bytes.Equal(got, want) {
 		t.Errorf("на провод ушло:\n получено %#v\n ожидалось %#v", got, want)
+	}
+}
+
+// TestRequestAllWritesExactBytes проверяет раскладку запроса состояний:
+// PD=14, нулевые id и subid, пустая нагрузка и — главное — нулевой client id
+// вместо полученного при рукопожатии.
+func TestRequestAllWritesExactBytes(t *testing.T) {
+	s := newFakeServer(t, 0x10, tagSHCXML)
+	c := testClient(t, s.addr())
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	if err := c.RequestAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	want := refPackReceiveData(0, 0, 0, PDRequestAllDevices, 0, nil)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(s.Received()) >= len(want) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := s.Received(); !bytes.Equal(got, want) {
+		t.Errorf("на провод ушло:\n получено %#v\n ожидалось %#v", got, want)
+	}
+	if c.ClientID() == 0 {
+		t.Fatal("client id рукопожатия равен нулю — тест не отличит его от нуля в пакете")
+	}
+}
+
+func TestRequestAllWithoutConnect(t *testing.T) {
+	c := testClient(t, "127.0.0.1:1")
+	if err := c.RequestAll(context.Background()); !errors.Is(err, ErrNotConnected) {
+		t.Errorf("получено %v, ожидалась ErrNotConnected", err)
 	}
 }
 

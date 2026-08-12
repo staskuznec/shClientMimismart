@@ -20,20 +20,22 @@ const (
 const maxPayload = math.MaxUint16
 
 // Value — значение, готовое к отправке. Создаётся конструкторами [Text],
-// [Sensor] и [SensorRaw]; реализовать интерфейс снаружи пакета нельзя, чтобы
-// на провод не попали пакеты с неизвестной раскладкой.
+// [Byte], [Raw], [Sensor] и [SensorRaw]; реализовать интерфейс снаружи пакета
+// нельзя, чтобы на провод не попали пакеты с неизвестной раскладкой.
 type Value interface {
 	pack(clientID uint16) []byte
 }
 
-// textValue — текстовый статус.
-type textValue struct {
+// rawValue — полезная нагрузка, которая уходит на провод как есть.
+// За ней стоят [Text], [Byte] и [Raw]: они отличаются только тем, как
+// собирают байты, и проверками на входе.
+type rawValue struct {
 	id      uint16
 	subID   uint8
 	payload []byte
 }
 
-func (v textValue) pack(clientID uint16) []byte {
+func (v rawValue) pack(clientID uint16) []byte {
 	return packPacket(clientID, v.id, v.subID, PDSetStatusToServer, v.payload)
 }
 
@@ -56,7 +58,35 @@ func Text(id uint16, subID uint8, text string) (Value, error) {
 	if len(text) > maxPayload {
 		return nil, ErrPayloadTooLarge
 	}
-	return textValue{id: id, subID: subID, payload: []byte(text)}, nil
+	return rawValue{id: id, subID: subID, payload: []byte(text)}, nil
+}
+
+// Byte создаёт однобайтовое значение для элемента id/subID.
+//
+// Часть элементов хранит состояние ровно в одном байте: лампа, скрипт, клапан,
+// шторы, ворота, датчики двери и протечки. Показание датчика такому элементу
+// слать нельзя: [Sensor] пакует значение в два байта fixed-point 8.8, и
+// единица уезжает как 00 01 — младший байт нулевой, элемент остаётся
+// выключенным. Выключение при этом внешне работает, потому что ноль даёт нули
+// в обоих байтах, — отсюда ощущение, что статус пропадает через раз.
+//
+// Ошибиться тут нечем: один байт помещается в поле длины всегда, поэтому
+// ошибка не возвращается.
+func Byte(id uint16, subID uint8, v uint8) Value {
+	return rawValue{id: id, subID: subID, payload: []byte{v}}
+}
+
+// Raw создаёт значение с произвольной полезной нагрузкой: байты уходят на
+// провод как есть. Нужен для элементов, чья раскладка не сводится ни к тексту,
+// ни к показанию датчика.
+//
+// Возвращает [ErrPayloadTooLarge], если payload не помещается в поле длины.
+// Срез копируется, поэтому его изменение после вызова на отправку не влияет.
+func Raw(id uint16, subID uint8, payload []byte) (Value, error) {
+	if len(payload) > maxPayload {
+		return nil, ErrPayloadTooLarge
+	}
+	return rawValue{id: id, subID: subID, payload: append([]byte(nil), payload...)}, nil
 }
 
 // Sensor создаёт показание датчика для элемента id/subID.

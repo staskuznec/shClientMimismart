@@ -136,3 +136,76 @@ func TestTextTooLarge(t *testing.T) {
 		t.Errorf("ожидалась ErrPayloadTooLarge, получено %v", err)
 	}
 }
+
+// TestPackEquivalenceByte сверяет однобайтовое значение с эталонной упаковкой:
+// тот же PD, длина 1, полезная нагрузка из одного байта.
+func TestPackEquivalenceByte(t *testing.T) {
+	for _, v := range []uint8{0, 1, 8, 9, 0x7F, 0xFF} {
+		got := Byte(773, 1, v).pack(2031)
+		want := refPackReceiveData(2031, 773, 1, PDSetStatusToServer, 1, []byte{v})
+		if !bytes.Equal(got, want) {
+			t.Errorf("Byte(%#x):\n получено %#v\n эталон   %#v", v, got, want)
+		}
+	}
+}
+
+// TestByteVsSensorForUnitValue фиксирует ту самую разницу, ради которой
+// появился Byte: у датчика единица уезжает как 00 01, и однобайтовый элемент
+// читает из неё ноль.
+func TestByteVsSensorForUnitValue(t *testing.T) {
+	sensor, err := Sensor(773, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sensorPkt := sensor.pack(0)
+	if got := sensorPkt[headerSize:]; !bytes.Equal(got, []byte{0x00, 0x01}) {
+		t.Fatalf("Sensor(1) упакован как %#v, ожидалось 00 01", got)
+	}
+
+	bytePkt := Byte(773, 1, 1).pack(0)
+	if got := bytePkt[headerSize:]; !bytes.Equal(got, []byte{0x01}) {
+		t.Errorf("Byte(1) упакован как %#v, ожидался один байт 01", got)
+	}
+	if got := binary.LittleEndian.Uint16(bytePkt[8:10]); got != 1 {
+		t.Errorf("длина в заголовке = %d, ожидалась 1", got)
+	}
+}
+
+func TestPackEquivalenceRaw(t *testing.T) {
+	payloads := [][]byte{{}, {0xFF}, {0x01, 0x02, 0x03}, bytes.Repeat([]byte{0xAB}, 300)}
+	for _, p := range payloads {
+		value, err := Raw(42, 7, p)
+		if err != nil {
+			t.Fatalf("Raw(%d байт): %v", len(p), err)
+		}
+		got := value.pack(2031)
+		want := refPackReceiveData(2031, 42, 7, PDSetStatusToServer, uint16(len(p)), p)
+		if !bytes.Equal(got, want) {
+			t.Errorf("Raw(%d байт):\n получено %#v\n эталон   %#v", len(p), got, want)
+		}
+	}
+}
+
+func TestRawTooLarge(t *testing.T) {
+	if _, err := Raw(1, 0, make([]byte, maxPayload+1)); !errors.Is(err, ErrPayloadTooLarge) {
+		t.Errorf("ожидалась ErrPayloadTooLarge, получено %v", err)
+	}
+	if _, err := Raw(1, 0, make([]byte, maxPayload)); err != nil {
+		t.Errorf("payload ровно в предел отвергнут: %v", err)
+	}
+}
+
+// TestRawCopiesPayload проверяет, что значение не держит ссылку на срез
+// вызывающего: переиспользование буфера не должно менять то, что уедет.
+func TestRawCopiesPayload(t *testing.T) {
+	buf := []byte{0x01, 0x02}
+	value, err := Raw(1, 0, buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf[0] = 0xFF
+
+	if got := value.pack(0)[headerSize:]; !bytes.Equal(got, []byte{0x01, 0x02}) {
+		t.Errorf("полезная нагрузка = %#v, ожидалось 01 02 — срез не скопирован", got)
+	}
+}
