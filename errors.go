@@ -21,6 +21,17 @@ var (
 	// ErrHandshakeFailed — сервер не прислал shcxml за отведённое число попыток.
 	ErrHandshakeFailed = errors.New("shclient: сервер не прислал shcxml")
 
+	// ErrAlreadyListening — чтение из сокета уже занято циклом Listen.
+	// Возвращается из повторного Listen и из Drain при запущенном слушателе.
+	ErrAlreadyListening = errors.New("shclient: чтение уже занято Listen")
+
+	// ErrNilHandler — в Listen не передан обработчик событий.
+	ErrNilHandler = errors.New("shclient: не задан обработчик событий")
+
+	// ErrIdleTimeout — от сервера ничего не приходило дольше, чем задано
+	// в WithIdleTimeout. Обычно означает, что связь оборвалась молча.
+	ErrIdleTimeout = errors.New("shclient: сервер молчит слишком долго")
+
 	// ErrValueOutOfRange — значение не представимо в fixed-point 8.8.
 	// Диапазон задан константами SensorMin и SensorMax.
 	ErrValueOutOfRange = errors.New("shclient: значение вне диапазона fixed-point 8.8")

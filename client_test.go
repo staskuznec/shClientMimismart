@@ -26,8 +26,10 @@ type fakeServer struct {
 	junkTags []string
 
 	mu       sync.Mutex
-	received []byte // всё, что пришло после рукопожатия
-	xmlSent  string // XML-запрос, полученный от клиента
+	received []byte   // всё, что пришло после рукопожатия
+	xmlSent  string   // XML-запрос, полученный от клиента
+	conn     net.Conn // соединение с клиентом, доступно после рукопожатия
+	ready    chan struct{}
 	done     chan struct{}
 }
 
@@ -44,7 +46,8 @@ func newFakeServerLogic(t *testing.T, serverB byte, reply string, logic []byte, 
 	}
 	s := &fakeServer{
 		t: t, ln: ln, serverB: serverB, reply: reply,
-		logic: logic, junkTags: junkTags, done: make(chan struct{}),
+		logic: logic, junkTags: junkTags,
+		ready: make(chan struct{}), done: make(chan struct{}),
 	}
 	go s.serve()
 	t.Cleanup(func() { _ = ln.Close() })
@@ -63,6 +66,101 @@ func (s *fakeServer) XMLRequest() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.xmlSent
+}
+
+// push отправляет клиенту сырые байты. Ждёт окончания рукопожатия, чтобы
+// пакет не попал в его середину.
+func (s *fakeServer) push(b []byte) {
+	select {
+	case <-s.ready:
+	case <-time.After(2 * time.Second):
+		s.t.Error("рукопожатие не завершилось, пакет не отправлен")
+		return
+	}
+
+	s.mu.Lock()
+	conn := s.conn
+	s.mu.Unlock()
+	if conn == nil {
+		return
+	}
+	if _, err := conn.Write(b); err != nil {
+		s.t.Errorf("отправка пакета клиенту: %v", err)
+	}
+}
+
+// closeConn рвёт соединение со стороны сервера.
+func (s *fakeServer) closeConn() {
+	<-s.ready
+	s.mu.Lock()
+	conn := s.conn
+	s.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+// inFrame собирает входящий пакет: заголовок той же раскладки, что
+// у исходящего, но байты 5 и 6 несут trans id и subid отправителя.
+func inFrame(senderID, destID uint16, pd, transID, senderSub, destSub uint8, payload []byte) []byte {
+	buf := make([]byte, headerSize+len(payload))
+	binary.LittleEndian.PutUint16(buf[0:2], senderID)
+	binary.LittleEndian.PutUint16(buf[2:4], destID)
+	buf[4] = pd
+	buf[5] = transID
+	buf[6] = senderSub
+	buf[7] = destSub
+	binary.LittleEndian.PutUint16(buf[8:10], uint16(len(payload)))
+	copy(buf[headerSize:], payload)
+	return buf
+}
+
+// collector копит события из Listen и позволяет дождаться нужного их числа.
+type collector struct {
+	mu     sync.Mutex
+	events []Event
+}
+
+func (c *collector) handle(e Event) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.events = append(c.events, e)
+}
+
+func (c *collector) all() []Event {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]Event(nil), c.events...)
+}
+
+// wait ждёт, пока накопится n событий. Возвращает то, что успело прийти.
+func (c *collector) wait(n int, d time.Duration) []Event {
+	deadline := time.Now().Add(d)
+	for time.Now().Before(deadline) {
+		if got := c.all(); len(got) >= n {
+			return got
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return c.all()
+}
+
+// listenInBackground запускает Listen и возвращает функцию ожидания его
+// завершения вместе с ошибкой.
+func listenInBackground(t *testing.T, c *Client, ctx context.Context, h Handler) func() error {
+	t.Helper()
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.Listen(ctx, h) }()
+
+	return func() error {
+		select {
+		case err := <-errCh:
+			return err
+		case <-time.After(3 * time.Second):
+			t.Fatal("Listen не завершился за отведённое время")
+			return nil
+		}
+	}
 }
 
 func (s *fakeServer) serve() {
@@ -128,6 +226,12 @@ func (s *fakeServer) serve() {
 	default:
 		return
 	}
+
+	// Рукопожатие прошло: с этого момента тест может слать пакеты клиенту.
+	s.mu.Lock()
+	s.conn = conn
+	s.mu.Unlock()
+	close(s.ready)
 
 	// 5. Копим всё, что клиент пришлёт дальше.
 	buf := make([]byte, 4096)
@@ -399,10 +503,11 @@ func TestSendWritesExactBytes(t *testing.T) {
 }
 
 // TestRequestAllWritesExactBytes проверяет раскладку запроса состояний:
-// PD=14, нулевые id и subid, пустая нагрузка и — главное — нулевой client id
-// вместо полученного при рукопожатии.
+// PD=14, нулевые id и subid элемента, пустая нагрузка и client id из
+// рукопожатия — в точности как в эталонах на PHP и Python.
 func TestRequestAllWritesExactBytes(t *testing.T) {
-	s := newFakeServer(t, 0x10, tagSHCXML)
+	const serverByte = 0x10
+	s := newFakeServer(t, serverByte, tagSHCXML)
 	c := testClient(t, s.addr())
 	if err := c.Connect(context.Background()); err != nil {
 		t.Fatal(err)
@@ -413,7 +518,12 @@ func TestRequestAllWritesExactBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	want := refPackReceiveData(0, 0, 0, PDRequestAllDevices, 0, nil)
+	clientID := initClientDefValue - uint16(serverByte)
+	if clientID == 0 {
+		t.Fatal("client id рукопожатия равен нулю — тест не отличит его от нуля")
+	}
+	want := refPackReceiveData(clientID, 0, 0, PDRequestAllDevices, 0, nil)
+
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		if len(s.Received()) >= len(want) {
@@ -423,9 +533,6 @@ func TestRequestAllWritesExactBytes(t *testing.T) {
 	}
 	if got := s.Received(); !bytes.Equal(got, want) {
 		t.Errorf("на провод ушло:\n получено %#v\n ожидалось %#v", got, want)
-	}
-	if c.ClientID() == 0 {
-		t.Fatal("client id рукопожатия равен нулю — тест не отличит его от нуля в пакете")
 	}
 }
 

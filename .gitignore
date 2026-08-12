@@ -20,3 +20,4 @@ coverage.html
 # ОС
 .DS_Store
 Thumbs.db
+/tmp/

@@ -164,6 +164,77 @@ if clamped {
 shclient.SensorRaw(100, 1, raw) // готовое значение fixed-point 8.8
 ```
 
+## Приём событий
+
+`Listen` читает пакеты от сервера, пока жив контекст. Обработчик вызывается
+синхронно из цикла чтения: события не теряются и не переупорядочиваются, но
+затянутая обработка тормозит приём — тяжёлую работу уносите в свою очередь.
+
+```go
+// Сервер не обязан присылать состояния сам — на старте их стоит спросить.
+if err := c.RequestAll(ctx); err != nil {
+	return err
+}
+
+err := c.Listen(ctx, func(e shclient.Event) {
+	log.Printf("%d:%d = % x", e.SenderID, e.SenderSubID, e.Payload)
+})
+```
+
+Ответ на `RequestAll` приходит пакетами `PD=15`, где состояния всех элементов
+модуля лежат подряд. Наружу они отдаются по событию на элемент, как если бы
+пришли поодиночке.
+
+Отправлять значения во время работы `Listen` можно — запись и чтение разведены
+по разным блокировкам. Чтение принадлежит одной горутине, поэтому второй
+`Listen` и `Drain` при живом слушателе вернут `ErrAlreadyListening`, а
+автоматическое вычитывание после `Send` отключается само.
+
+## Долгая жизнь соединения
+
+Переподключение живёт в вызывающем коде: клиент готов к повторному `Connect`
+после `Close`, а `Listen` возвращает ошибку на обрыве. Из этого собирается цикл
+с той политикой пауз, которая нужна вам:
+
+```go
+c, err := shclient.New(addr, key,
+	// Без keepalive сервер выкинет молчащего клиента, а без idle timeout
+	// клиент не заметит молча оборвавшуюся связь.
+	shclient.WithKeepalive(shclient.ReferenceKeepalive),
+	shclient.WithIdleTimeout(3*shclient.ReferenceKeepalive),
+)
+
+backoff := time.Second
+for {
+	if err := c.Connect(ctx); err != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > time.Minute {
+			backoff = time.Minute
+		}
+		continue
+	}
+	backoff = time.Second // соединение поднялось — пауза начинается заново
+
+	_ = c.RequestAll(ctx)
+	err := c.Listen(ctx, handle)
+	_ = c.Close()
+
+	if ctx.Err() != nil {
+		return ctx.Err() // выключаемся, а не переподключаемся
+	}
+	log.Printf("связь потеряна: %v", err) // данные устарели
+}
+```
+
+Оборванное TCP-соединение само себя не обнаруживает: запись в него продолжает
+удаваться, пока не переполнится буфер. Поэтому `WithIdleTimeout` — единственный
+быстрый способ заметить обрыв, и имеет он смысл только вместе с `WithKeepalive`,
+иначе тишина в спокойном доме нормальна.
+
 ## Описание дома
 
 В ответе на рукопожатие сервер присылает `logic.xml` — дерево областей с
@@ -190,23 +261,14 @@ c, err := shclient.New(addr, key, shclient.WithLogicSink(f))
 
 Разбор XML — дело вызывающего кода: библиотека отдаёт сырые байты.
 
-Состояния элементов запрашиваются отдельно:
-
-```go
-if err := c.RequestAll(ctx); err != nil {
-	return err
-}
-```
-
-Ответ приходит пакетами `PD=15`, которые эта версия клиента не разбирает, —
-вычитать их нужно самостоятельно через `Drain`.
-
 ## Настройки
 
 ```go
 c, err := shclient.New(addr, key,
 	shclient.WithLogger(slog.Default()),        // по умолчанию логов нет
 	shclient.WithLogicSink(f),                  // по умолчанию logic.xml отбрасывается
+	shclient.WithKeepalive(5*time.Second),      // по умолчанию выключено
+	shclient.WithIdleTimeout(15*time.Second),   // по умолчанию ждать сколько угодно
 	shclient.WithDialTimeout(10*time.Second),
 	shclient.WithReadTimeout(15*time.Second),
 	shclient.WithWriteTimeout(10*time.Second),

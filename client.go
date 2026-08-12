@@ -11,6 +11,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,15 +27,25 @@ type Sender interface {
 
 // Client — соединение с сервером умного дома. Безопасен для одновременного
 // использования из нескольких горутин.
+//
+// Блокировок две, потому что отправка и приём должны идти одновременно.
+// mu защищает состояние соединения и берётся только на время снимка — держать
+// её весь батч нельзя, иначе на ней встанет цикл чтения. writeMu отвечает
+// за сокет на запись и держится всю отправку, чтобы батч не перемешался
+// с чужими пакетами. Чтение принадлежит одной горутине: либо [Client.Listen],
+// либо [Client.Drain], одновременно им нельзя.
 type Client struct {
 	addr  string
 	key   []byte
 	macID string
 	opts  options
 
-	mu       sync.Mutex
-	conn     net.Conn
-	clientID uint16
+	mu        sync.Mutex
+	conn      net.Conn
+	clientID  uint16
+	listening bool
+
+	writeMu sync.Mutex
 }
 
 // Проверка на этапе компиляции, что клиент реализует Sender.
@@ -84,6 +95,26 @@ func (c *Client) Connected() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.conn != nil
+}
+
+// Listening сообщает, запущен ли цикл чтения [Client.Listen].
+func (c *Client) Listening() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.listening
+}
+
+// state отдаёт снимок состояния соединения. Блокировка берётся только на
+// время снимка: держать её всю операцию нельзя, иначе отправка и чтение
+// начнут ждать друг друга.
+func (c *Client) state() (conn net.Conn, clientID uint16, listening bool, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn == nil {
+		return nil, 0, false, ErrNotConnected
+	}
+	return c.conn, c.clientID, c.listening, nil
 }
 
 // Connect устанавливает соединение, проходит авторизацию и рукопожатие.
@@ -140,21 +171,24 @@ func (c *Client) Close() error {
 //
 // Между пакетами выдерживается пауза (см. [WithPacketDelay]), а после
 // отправки клиент вычитывает ответы сервера (см. [WithAutoDrain]) — без этого
-// сервер может закрыть соединение, решив, что клиент его не слушает.
+// сервер может закрыть соединение, решив, что клиент его не слушает. При
+// запущенном [Client.Listen] вычитывание не нужно и не выполняется: ответы
+// разбирает цикл чтения.
 func (c *Client) Send(ctx context.Context, values ...Value) error {
 	if len(values) == 0 {
 		return nil
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return ErrNotConnected
+	conn, clientID, listening, err := c.state()
+	if err != nil {
+		return err
 	}
-	conn := c.conn
 
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	// Срок ставится только на запись: общий SetDeadline сбил бы и цикл чтения.
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetWriteDeadline(time.Now()) })
 	defer stop()
 
 	for i, v := range values {
@@ -163,13 +197,13 @@ func (c *Client) Send(ctx context.Context, values ...Value) error {
 				return err
 			}
 		}
-		if err := c.write(conn, v.pack(c.clientID)); err != nil {
+		if err := c.write(conn, v.pack(clientID)); err != nil {
 			return fmt.Errorf("shclient: отправка значения %d из %d: %w", i+1, len(values), err)
 		}
 	}
 	c.opts.logger.DebugContext(ctx, "shclient: батч отправлен", "count", len(values))
 
-	if c.opts.autoDrain {
+	if c.opts.autoDrain && !listening {
 		if err := sleepCtx(ctx, c.opts.settleDelay); err != nil {
 			return err
 		}
@@ -178,27 +212,29 @@ func (c *Client) Send(ctx context.Context, values ...Value) error {
 	return nil
 }
 
-// RequestAll просит сервер отдать состояния всех элементов.
+// RequestAll просит сервер отдать состояния всех элементов. Ответ приходит
+// пакетами [PDPingModule], которые разбирает [Client.Listen].
 //
-// Ответ приходит пачками пакетов [PDPingModule]; эта версия клиента их не
-// разбирает, поэтому вычитать их нужно самостоятельно — через [Client.Drain]
-// или автоматическим вычитыванием после [Client.Send].
+// Пакет уходит с идентификатором клиента, полученным при рукопожатии, и с
+// нулевыми id и subid элемента: нули здесь означают «все устройства» и к
+// client id отношения не имеют. Эталонные реализации на PHP и Python делают
+// ровно так же.
 //
-// Пакет уходит с нулевым идентификатором клиента, а не с полученным при
-// рукопожатии: так делают эталонные реализации.
+// Этим же пакетом эталонный Python-клиент поддерживает соединение живым,
+// повторяя его каждые пять секунд, — см. [WithKeepalive].
 func (c *Client) RequestAll(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return ErrNotConnected
+	conn, clientID, _, err := c.state()
+	if err != nil {
+		return err
 	}
-	conn := c.conn
 
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetWriteDeadline(time.Now()) })
 	defer stop()
 
-	if err := c.write(conn, packPacket(0, 0, 0, PDRequestAllDevices, nil)); err != nil {
+	if err := c.write(conn, packPacket(clientID, 0, 0, PDRequestAllDevices, nil)); err != nil {
 		return fmt.Errorf("shclient: запрос состояний: %w", err)
 	}
 	c.opts.logger.DebugContext(ctx, "shclient: запрошены состояния всех элементов")
@@ -207,20 +243,216 @@ func (c *Client) RequestAll(ctx context.Context) error {
 
 // Drain вычитывает и отбрасывает всё, что сервер прислал в течение d.
 // Нужен, если автоматическое вычитывание отключено через [WithAutoDrain].
+//
+// Пока работает [Client.Listen], вычитывать нечего и нельзя: вернётся
+// [ErrAlreadyListening].
 func (c *Client) Drain(ctx context.Context, d time.Duration) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	if c.conn == nil {
-		return ErrNotConnected
+	conn, _, listening, err := c.state()
+	if err != nil {
+		return err
 	}
-	conn := c.conn
+	if listening {
+		return ErrAlreadyListening
+	}
 
-	stop := context.AfterFunc(ctx, func() { _ = conn.SetDeadline(time.Now()) })
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetReadDeadline(time.Now()) })
 	defer stop()
 
 	c.drain(conn, d)
 	return nil
+}
+
+// Handler обрабатывает событие от сервера.
+//
+// Вызывается синхронно из цикла чтения: пока Handler работает, следующие
+// пакеты не читаются. Поэтому события не теряются и не переупорядочиваются,
+// но затянутая обработка тормозит приём — тяжёлую работу уносите в свою
+// очередь.
+type Handler func(Event)
+
+// Listen читает пакеты от сервера и отдаёт их обработчику, пока не будет
+// отменён контекст или не порвётся соединение.
+//
+// Возвращает [ErrAlreadyListening], если цикл уже запущен: чтение из сокета
+// принадлежит одной горутине. Отправлять значения во время работы Listen
+// можно — запись и чтение разведены.
+//
+// Отмена контекста завершает цикл и возвращает ошибку контекста. Обрыв
+// соединения возвращается как ошибка чтения; переподключение — дело
+// вызывающего кода, клиент готов к повторному [Client.Connect] после
+// [Client.Close].
+func (c *Client) Listen(ctx context.Context, h Handler) error {
+	if h == nil {
+		return ErrNilHandler
+	}
+
+	conn, err := c.startListen()
+	if err != nil {
+		return err
+	}
+	defer c.stopListen()
+
+	// cancelled нужен, потому что срок чтения переставляется на каждой
+	// итерации и может затереть тот, что выставила отмена контекста.
+	var cancelled atomic.Bool
+	stop := context.AfterFunc(ctx, func() {
+		cancelled.Store(true)
+		_ = conn.SetReadDeadline(time.Now())
+	})
+	defer stop()
+
+	if c.opts.keepalive > 0 {
+		kctx, cancel := context.WithCancel(ctx)
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.keepaliveLoop(kctx)
+		}()
+		// Порядок важен: сначала отменяем контекст, потом ждём горутину.
+		defer wg.Wait()
+		defer cancel()
+	}
+
+	c.opts.logger.InfoContext(ctx, "shclient: цикл чтения запущен")
+	return c.readLoop(ctx, conn, &cancelled, h)
+}
+
+// readLoop — сам цикл чтения. Вынесен отдельно, чтобы Listen остался про
+// запуск и остановку, а не про разбор кадров.
+func (c *Client) readLoop(ctx context.Context, conn net.Conn, cancelled *atomic.Bool, h Handler) error {
+	head := make([]byte, headerSize)
+	for {
+		// Ожидание следующего пакета не ограничено readTimeout: между
+		// событиями в тихом доме проходят часы. Ограничивает только
+		// [WithIdleTimeout], если он задан.
+		var wait time.Time
+		if c.opts.idleTimeout > 0 {
+			wait = time.Now().Add(c.opts.idleTimeout)
+		}
+		if err := setReadDeadline(conn, cancelled, wait); err != nil {
+			return err
+		}
+		if _, err := io.ReadFull(conn, head); err != nil {
+			return c.readError(ctx, cancelled, err, true)
+		}
+
+		in := parseInHeader(head)
+		payload := make([]byte, in.length)
+		if in.length > 0 {
+			// А вот хвост пакета обязан прийти сразу: заголовок уже прочитан.
+			if err := setReadDeadline(conn, cancelled, time.Now().Add(c.opts.readTimeout)); err != nil {
+				return err
+			}
+			if _, err := io.ReadFull(conn, payload); err != nil {
+				return c.readError(ctx, cancelled, err, false)
+			}
+		}
+		at := time.Now()
+
+		if in.pd == PDPingModule {
+			// Ответ модуля — это состояния всех его элементов сразу.
+			// Наружу отдаём по событию на элемент: потребителю всё равно,
+			// пришло состояние поодиночке или пачкой.
+			states, tail := splitModuleStates(payload)
+			for _, st := range states {
+				h(Event{
+					SenderID:    in.senderID,
+					SenderSubID: st.subID,
+					PD:          in.pd,
+					Payload:     st.payload,
+					At:          at,
+				})
+			}
+			if tail > 0 {
+				c.opts.logger.WarnContext(ctx, "shclient: хвост ответа модуля не разобран",
+					"sender_id", in.senderID, "bytes", tail)
+			}
+			continue
+		}
+
+		h(Event{
+			SenderID:    in.senderID,
+			SenderSubID: in.senderSubID,
+			PD:          in.pd,
+			Payload:     payload,
+			At:          at,
+		})
+	}
+}
+
+// keepaliveLoop повторяет запрос состояний, пока жив контекст: эталонный
+// Python-клиент так же не даёт серверу выкинуть себя по таймауту.
+func (c *Client) keepaliveLoop(ctx context.Context) {
+	t := time.NewTicker(c.opts.keepalive)
+	defer t.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := c.RequestAll(ctx); err != nil {
+				// Писать больше некуда: соединение порвано, и цикл чтения
+				// вот-вот вернёт ту же ошибку вызывающему.
+				c.opts.logger.DebugContext(ctx, "shclient: keepalive не отправлен", "err", err)
+				return
+			}
+		}
+	}
+}
+
+// startListen занимает чтение под цикл Listen.
+func (c *Client) startListen() (net.Conn, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.conn == nil {
+		return nil, ErrNotConnected
+	}
+	if c.listening {
+		return nil, ErrAlreadyListening
+	}
+	c.listening = true
+	return c.conn, nil
+}
+
+func (c *Client) stopListen() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.listening = false
+}
+
+// setReadDeadline ставит срок чтения, не затирая отмену контекста.
+//
+// Проверки до и после установки закрывают гонку с [context.AfterFunc]: если
+// отмена случилась между ними, срок возвращается на «сейчас» нашими же руками,
+// а если после — выигрывает установка из AfterFunc. Нулевое время t означает
+// чтение без ограничения по сроку.
+func setReadDeadline(conn net.Conn, cancelled *atomic.Bool, t time.Time) error {
+	if cancelled.Load() {
+		return nil // срок уже выставлен отменой, чтение вернётся с ошибкой
+	}
+	if err := conn.SetReadDeadline(t); err != nil {
+		return err
+	}
+	if cancelled.Load() {
+		_ = conn.SetReadDeadline(time.Now())
+	}
+	return nil
+}
+
+// readError переводит ошибку чтения в ту, которую стоит показать вызывающему.
+// Флаг idle различает ожидание следующего пакета и чтение хвоста уже начатого.
+func (c *Client) readError(ctx context.Context, cancelled *atomic.Bool, err error, idle bool) error {
+	if cancelled.Load() {
+		return ctx.Err()
+	}
+	var netErr net.Error
+	if idle && c.opts.idleTimeout > 0 && errors.As(err, &netErr) && netErr.Timeout() {
+		return fmt.Errorf("%w: тишина дольше %s", ErrIdleTimeout, c.opts.idleTimeout)
+	}
+	return fmt.Errorf("shclient: чтение пакета: %w", err)
 }
 
 // authorize отвечает на challenge сервера: 16 байт шифруются одним блоком AES.

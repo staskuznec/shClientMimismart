@@ -22,6 +22,11 @@ const (
 	// может закрыть соединение, решив, что клиент не слушает.
 	DefaultSettleDelay  = 200 * time.Millisecond
 	DefaultDrainTimeout = 500 * time.Millisecond
+
+	// ReferenceKeepalive — период, с которым эталонный Python-клиент шлёт
+	// запрос состояний, чтобы сервер не выкинул его по таймауту.
+	// Значение по умолчанию не задаётся: см. [WithKeepalive].
+	ReferenceKeepalive = 5 * time.Second
 )
 
 // options — внутренняя конфигурация клиента.
@@ -32,6 +37,8 @@ type options struct {
 	packetDelay  time.Duration
 	settleDelay  time.Duration
 	drainTimeout time.Duration
+	keepalive    time.Duration
+	idleTimeout  time.Duration
 	autoDrain    bool
 	udpRetrans   bool
 	macID        string
@@ -103,6 +110,28 @@ func WithUDPRetranslate(v bool) Option {
 // на crypto/rand.
 func WithMacID(mac string) Option {
 	return func(o *options) { o.macID = mac }
+}
+
+// WithKeepalive включает поддержание соединения: пока работает
+// [Client.Listen], клиент раз в d повторяет [Client.RequestAll], чтобы сервер
+// не выкинул его по таймауту. Ноль (по умолчанию) отключает поддержание.
+//
+// Эталонный Python-клиент делает это каждые [ReferenceKeepalive].
+func WithKeepalive(d time.Duration) Option {
+	return func(o *options) { o.keepalive = d }
+}
+
+// WithIdleTimeout задаёт, сколько [Client.Listen] готов ждать следующего
+// пакета. По истечении цикл завершается с [ErrIdleTimeout]. Ноль (по
+// умолчанию) означает ждать сколько угодно.
+//
+// Это единственный быстрый способ заметить, что связь оборвалась молча:
+// оборванное TCP-соединение само себя не обнаруживает, а запись в него
+// продолжает удаваться, пока не переполнится буфер. Имеет смысл только
+// вместе с [WithKeepalive] — иначе тишина в спокойном доме нормальна, — и
+// значение стоит брать кратным периоду поддержания, например втрое больше.
+func WithIdleTimeout(d time.Duration) Option {
+	return func(o *options) { o.idleTimeout = d }
 }
 
 // WithLogicSink задаёт приёмник для logic.xml — описания областей и элементов,
