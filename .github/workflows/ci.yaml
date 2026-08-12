@@ -12,11 +12,13 @@ jobs:
       matrix:
         go: ["1.22", "1.23", "1.24", "1.25"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go }}
+          # у пакета нет внешних зависимостей и go.sum, кэшировать нечего
+          cache: false
 
       - name: gofmt
         run: |
